@@ -603,6 +603,9 @@ class Qwen3TTSRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        if hidden_states.is_cuda and hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            return F.rms_norm(hidden_states, tuple(self.weight.shape), self.weight, self.variance_epsilon)
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -877,8 +880,23 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    def _apply_rotary_single(x: torch.Tensor, c: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        half_dim = x.shape[-1] // 2
+        x1 = x[..., :half_dim]
+        x2 = x[..., half_dim:]
+        c1 = c[..., :half_dim]
+        c2 = c[..., half_dim:]
+        s1 = s[..., :half_dim]
+        s2 = s[..., half_dim:]
+
+        out = torch.empty_like(x)
+        out[..., :half_dim] = (x1 * c1) - (x2 * s1)
+        out[..., half_dim:] = (x2 * c2) + (x1 * s2)
+        return out
+
+    q_embed = _apply_rotary_single(q, cos, sin)
+    k_embed = _apply_rotary_single(k, cos, sin)
     return q_embed, k_embed
 
 
@@ -1608,6 +1626,99 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
     def get_decoder(self):
         return self.model
+
+    @staticmethod
+    def _sample_subtalker_token(
+        logits: torch.Tensor,
+        do_sample: bool,
+        top_p: float,
+        top_k: int,
+        temperature: float,
+    ) -> torch.Tensor:
+        if not do_sample:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        scores = logits / max(float(temperature), 1e-5)
+
+        if top_k > 0:
+            topk_vals, topk_idx = torch.topk(scores, k=min(int(top_k), scores.shape[-1]), dim=-1)
+            masked = torch.full_like(scores, -float("inf"))
+            masked.scatter_(1, topk_idx, topk_vals)
+            scores = masked
+
+        if top_p < 1.0:
+            sorted_scores, sorted_idx = torch.sort(scores, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_scores, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            remove = cumulative > top_p
+            remove[:, 1:] = remove[:, :-1].clone()
+            remove[:, 0] = False
+            sorted_scores = sorted_scores.masked_fill(remove, -float("inf"))
+            scores = torch.full_like(scores, -float("inf"))
+            scores.scatter_(1, sorted_idx, sorted_scores)
+
+        probs = torch.softmax(scores, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    def _generate_subtalker_sequences_fast(
+        self,
+        past_hidden: torch.Tensor,
+        last_id_hidden: torch.Tensor,
+        do_sample: Optional[bool],
+        top_p: Optional[float],
+        top_k: Optional[int],
+        temperature: Optional[float],
+    ) -> torch.Tensor:
+        generation_cfg = getattr(self.code_predictor, "generation_config", None)
+        do_sample_resolved = bool(do_sample) if do_sample is not None else bool(getattr(generation_cfg, "do_sample", True))
+        top_p_resolved = float(top_p) if top_p is not None else float(getattr(generation_cfg, "top_p", 1.0))
+        top_k_resolved = int(top_k) if top_k is not None else int(getattr(generation_cfg, "top_k", 50))
+        temperature_resolved = (
+            float(temperature) if temperature is not None else float(getattr(generation_cfg, "temperature", 1.0))
+        )
+
+        max_new_tokens = self.config.num_code_groups - 1
+        subtalker_input_embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
+
+        outputs = self.code_predictor(
+            inputs_embeds=subtalker_input_embeds,
+            use_cache=True,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+
+        past_key_values = outputs.past_key_values
+        generation_steps = outputs.generation_steps
+        next_token = self._sample_subtalker_token(
+            outputs.logits[:, -1, :],
+            do_sample=do_sample_resolved,
+            top_p=top_p_resolved,
+            top_k=top_k_resolved,
+            temperature=temperature_resolved,
+        )
+        generated_tokens = [next_token]
+
+        for _ in range(1, max_new_tokens):
+            outputs = self.code_predictor(
+                input_ids=next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+                generation_steps=generation_steps,
+            )
+            past_key_values = outputs.past_key_values
+            generation_steps = outputs.generation_steps
+            next_token = self._sample_subtalker_token(
+                outputs.logits[:, -1, :],
+                do_sample=do_sample_resolved,
+                top_p=top_p_resolved,
+                top_k=top_k_resolved,
+                temperature=temperature_resolved,
+            )
+            generated_tokens.append(next_token)
+
+        return torch.cat(generated_tokens, dim=1)
     
     def forward_sub_talker_finetune(self, codec_ids, talker_hidden_states):
         assert len(codec_ids.shape) == 2
@@ -1668,20 +1779,18 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
+            subtalker_sequences = self._generate_subtalker_sequences_fast(
+                past_hidden=past_hidden,
+                last_id_hidden=last_id_hidden,
                 do_sample=subtalker_dosample,
                 top_p=subtalker_top_p,
                 top_k=subtalker_top_k,
                 temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
             )
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+            codec_ids = torch.cat((input_ids, subtalker_sequences), dim=-1)
             codec_hiddens = torch.cat(
                 [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                + [self.code_predictor.get_input_embeddings()[i](subtalker_sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
                 dim=1,
             )
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
@@ -1690,6 +1799,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 inputs_embeds = inputs_embeds + trailing_text_hidden[:, generation_step].unsqueeze(1)
             else:
                 inputs_embeds = inputs_embeds + tts_pad_embed
+
         if attention_mask is not None:
             if (
                 cache_position is None

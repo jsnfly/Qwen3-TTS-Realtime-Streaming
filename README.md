@@ -15,12 +15,61 @@
 
 We release **Qwen3-TTS**, a series of powerful speech generation capabilities developed by Qwen, offering comprehensive support for voice clone, voice design, ultra-high-quality human-like speech generation, and natural language-based voice control. It provides developers and users with the most extensive set of speech generation features available.
 
+## Fork Notes (Streaming Optimization)
+
+This fork includes a targeted optimization of the internal subtalker generation path for local streaming use-cases. The
+script `full_streaming_example.py` provides and example implementation for input (text) and output (audio) streaming.
+
+- Hardware/software tested: **RTX 4090**, **PyTorch 2.10.0**, **0.6B-Base model**.
+- On this setup, we observed approximate RTF improvements from around **~1.05** to **<0.8** for the local streaming benchmark.
+- These numbers are workload-dependent and should be treated as approximate.
+
+### What changed in this fork
+
+- Replaced the subtalker `code_predictor.generate(...)` call with a custom cached token-by-token loop inside `Qwen3TTSTalkerForConditionalGeneration`.
+- Simplified subtalker generation masking in that hot path (no dynamic per-step mask construction for this decode path).
+- Switched RMSNorm to `torch.nn.functional.rms_norm(...)` on CUDA, enabling fused RMSNorm kernels.
+- Reworked RoPE application (`apply_rotary_pos_emb`) to reduce temporary tensor churn in the hot path.
+- Kept quality/EOS behavior intact in local testing; no `torch.compile` path is enabled in final fork state.
+
+### Local benchmark script (fork-specific)
+
+This fork adds `full_streaming_example.py` at repo root.
+
+Before running it:
+1. Clone this repository.
+2. Install dependencies.
+3. Download model weights to a local directory (for example `./Qwen3-TTS-12Hz-0.6B-Base`).
+4. Provide a local reference wav (default: `./sample.wav`).
+
+Run:
+
+```bash
+python full_streaming_example.py \
+  --text "Hello from the optimized streaming fork." \
+  --language English \
+  --model-dir ./Qwen3-TTS-12Hz-0.6B-Base \
+  --ref-audio ./sample.wav \
+  --out-wav ./output_full_streaming.wav
+```
+
+Main CLI arguments:
+
+- `--model-dir`: local path to the Qwen3-TTS model directory (default `./Qwen3-TTS-12Hz-0.6B-Base`).
+- `--ref-audio`: local reference audio wav for voice cloning.
+- `--text`: text to synthesize.
+- `--language`: language label (e.g. `English`, `German`, `Auto`).
+- `--out-wav`: output wav path.
+- `--dtype`: `bf16` or `fp16`.
+- `--attn-mode`: `default`, `sdpa`, or `flash_attention_2`.
+
 
 ## News
 * 2026.1.22: 🎉🎉🎉 We have released [Qwen3-TTS](https://huggingface.co/collections/Qwen/qwen3-tts) series (0.6B/1.7B) based on Qwen3-TTS-Tokenizer-12Hz. Please check our [blog](https://qwen.ai/blog?id=qwen3tts-0115)!
 
 ## Contents <!-- omit in toc -->
 
+- [Fork Notes (Streaming Optimization)](#fork-notes-streaming-optimization)
 - [Overview](#overview)
   - [Introduction](#introduction)
   - [Model Architecture](#model-architecture)
