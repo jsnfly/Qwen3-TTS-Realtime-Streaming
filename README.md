@@ -17,20 +17,22 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
 
 ## Fork Notes (Streaming Optimization)
 
-This fork includes a targeted optimization of the internal subtalker generation path for local streaming use-cases. The
-script `full_streaming_example.py` provides and example implementation for input (text) and output (audio) streaming.
+This fork includes targeted local streaming optimizations for the internal subtalker generation path. The script
+`full_streaming_example.py` provides an example implementation for input (text) and output (audio) streaming.
 
 - Hardware/software tested: **RTX 4090**, **PyTorch 2.10.0**, **0.6B-Base model**.
-- On this setup, we observed approximate RTF improvements from around **~1.05** to **<0.8** for the local streaming benchmark.
+- On this setup, we observed approximate RTF improvements from around **~1.05** to roughly **~0.56-0.60** for the local streaming benchmark with the optional compiled subtalker path.
 - These numbers are workload-dependent and should be treated as approximate.
+- We do not make any benchmark claim here for FlashAttention 2; it was not part of the final retained benchmark path in this fork.
 
 ### What changed in this fork
 
 - Replaced the subtalker `code_predictor.generate(...)` call with a custom cached token-by-token loop inside `Qwen3TTSTalkerForConditionalGeneration`.
-- Simplified subtalker generation masking in that hot path (no dynamic per-step mask construction for this decode path).
 - Switched RMSNorm to `torch.nn.functional.rms_norm(...)` on CUDA, enabling fused RMSNorm kernels.
 - Reworked RoPE application (`apply_rotary_pos_emb`) to reduce temporary tensor churn in the hot path.
-- Kept quality/EOS behavior intact in local testing; no `torch.compile` path is enabled in final fork state.
+- Added a default `torch.compile` path for the inner code predictor model in `full_streaming_example.py`, which was the largest measured speedup in local testing.
+- Added a static-cache attempt for the subtalker/code predictor decode loop, with automatic fallback when `StaticCache` is unavailable in the installed `transformers` version.
+- Kept quality/EOS behavior intact in local testing for the final retained changes.
 
 ### Local benchmark script (fork-specific)
 
@@ -61,7 +63,7 @@ Main CLI arguments:
 - `--language`: language label (e.g. `English`, `German`, `Auto`).
 - `--out-wav`: output wav path.
 - `--dtype`: `bf16` or `fp16`.
-- `--attn-mode`: `default`, `sdpa`, or `flash_attention_2`.
+- The benchmark script compiles the inner subtalker/code-predictor model by default and warms it before timing.
 
 
 ## News

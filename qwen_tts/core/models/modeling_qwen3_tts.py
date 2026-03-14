@@ -16,6 +16,7 @@
 
 import json
 import os
+import inspect
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -27,6 +28,10 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
+try:
+    from transformers.cache_utils import StaticCache
+except ImportError:
+    StaticCache = None
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import (create_causal_mask,
@@ -1211,7 +1216,13 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
     def get_decoder(self):
         return self.model
-    
+
+    @staticmethod
+    def _maybe_mark_cudagraph_step_begin() -> None:
+        compiler = getattr(torch, "compiler", None)
+        if compiler is not None and hasattr(compiler, "cudagraph_mark_step_begin"):
+            compiler.cudagraph_mark_step_begin()
+
     def forward_finetune(
         self,
         input_ids=None,
@@ -1235,6 +1246,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        self._maybe_mark_cudagraph_step_begin()
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=None,
             attention_mask=attention_mask,
@@ -1300,6 +1312,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        self._maybe_mark_cudagraph_step_begin()
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=None,
             attention_mask=attention_mask,
@@ -1627,6 +1640,39 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
     def get_decoder(self):
         return self.model
 
+    def _allocate_subtalker_cache(
+        self,
+        batch_size: int,
+        max_cache_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Cache | None:
+        if StaticCache is None:
+            return None
+
+        init_kwargs = {
+            "config": self.code_predictor.model.config,
+            "max_cache_len": max_cache_len,
+            "device": device,
+            "dtype": dtype,
+        }
+        sig = inspect.signature(StaticCache)
+        if "max_batch_size" in sig.parameters:
+            init_kwargs["max_batch_size"] = batch_size
+        elif "batch_size" in sig.parameters:
+            init_kwargs["batch_size"] = batch_size
+        else:
+            return None
+
+        try:
+            return StaticCache(**init_kwargs)
+        except TypeError:
+            init_kwargs.pop("dtype", None)
+            try:
+                return StaticCache(**init_kwargs)
+            except TypeError:
+                return None
+
     @staticmethod
     def _sample_subtalker_token(
         logits: torch.Tensor,
@@ -1679,12 +1725,28 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
         max_new_tokens = self.config.num_code_groups - 1
         subtalker_input_embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
+        subtalker_cache_len = subtalker_input_embeds.shape[1] + max_new_tokens - 1
+        subtalker_cache = self._allocate_subtalker_cache(
+            batch_size=subtalker_input_embeds.shape[0],
+            max_cache_len=subtalker_cache_len,
+            device=subtalker_input_embeds.device,
+            dtype=subtalker_input_embeds.dtype,
+        )
+        prefill_cache_position = None
+        if subtalker_cache is not None:
+            prefill_cache_position = torch.arange(
+                subtalker_input_embeds.shape[1],
+                device=subtalker_input_embeds.device,
+                dtype=torch.long,
+            )
 
         outputs = self.code_predictor(
             inputs_embeds=subtalker_input_embeds,
+            past_key_values=subtalker_cache,
             use_cache=True,
             output_hidden_states=False,
             return_dict=True,
+            cache_position=prefill_cache_position,
         )
 
         past_key_values = outputs.past_key_values
@@ -1699,6 +1761,13 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         generated_tokens = [next_token]
 
         for _ in range(1, max_new_tokens):
+            decode_cache_position = None
+            if subtalker_cache is not None:
+                decode_cache_position = torch.tensor(
+                    [generation_steps + 1],
+                    device=next_token.device,
+                    dtype=torch.long,
+                )
             outputs = self.code_predictor(
                 input_ids=next_token,
                 past_key_values=past_key_values,
@@ -1706,6 +1775,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 output_hidden_states=False,
                 return_dict=True,
                 generation_steps=generation_steps,
+                cache_position=decode_cache_position,
             )
             past_key_values = outputs.past_key_values
             generation_steps = outputs.generation_steps

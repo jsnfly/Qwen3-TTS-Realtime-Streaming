@@ -243,9 +243,11 @@ class AsyncTTSGenerator:
         self.generation_task: tp.Optional[asyncio.Task] = None
         self.finished = False
         self.profile: dict[str, float] = {}
+        self.request_start_t: tp.Optional[float] = None
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for this script.")
+        self._configure_cuda_math()
         self.device = torch.device("cuda")
         self.dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
         self.tts, self.config = self._build_tts(Path(args.model_dir))
@@ -260,7 +262,78 @@ class AsyncTTSGenerator:
         prompt_items = self.tts.create_voice_clone_prompt(str(args.ref_audio), x_vector_only_mode=True)
         self.voice_clone_prompt = self.tts._prompt_items_to_voice_clone_prompt(prompt_items)
         self._move_speech_tokenizer_to_device(self.device)
+        self._compile_code_predictor()
         self.sample_rate = args.sample_rate
+
+    @staticmethod
+    def _configure_cuda_math() -> None:
+        torch.set_float32_matmul_precision("high")
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = True
+
+    def _compile_code_predictor(self) -> None:
+        inductor_config = getattr(torch, "_inductor", None)
+        config_mod = getattr(inductor_config, "config", None)
+        triton_cfg = getattr(config_mod, "triton", None)
+        if triton_cfg is not None and hasattr(triton_cfg, "cudagraphs"):
+            triton_cfg.cudagraphs = False
+        code_predictor = self.tts.model.talker.code_predictor
+        print(
+            "[compile] code_predictor scope=model backend=inductor mode=default cudagraphs=off"
+        )
+        code_predictor.model = torch.compile(code_predictor.model, backend="inductor", mode="default")
+        self._warmup_compiled_talker_step()
+
+    def _warmup_compiled_talker_step(self) -> None:
+        streamer = StreamingTextState(self.tts, holdback_tokens=self.args.token_holdback)
+        streamer.push_text("Warm up.", final_chunk=True)
+        input_ids = streamer.current_input_ids()
+        talker_input_embeds, attention_mask, tts_pad_embed = build_talker_inputs_xvector(
+            tts_model=self.tts,
+            input_id=input_ids,
+            voice_clone_prompt=self.voice_clone_prompt,
+            language=self.args.language,
+        )
+        trailing_text_hidden = streamer.trailing_text_hidden()
+
+        with torch.inference_mode():
+            prefill = self.tts.model.talker(
+                inputs_embeds=talker_input_embeds,
+                attention_mask=attention_mask,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+                trailing_text_hidden=trailing_text_hidden,
+                tts_pad_embed=tts_pad_embed,
+            )
+
+            input_token = torch.tensor(
+                [[self.config.talker_config.codec_bos_id]],
+                device=self.tts.model.device,
+                dtype=attention_mask.dtype,
+            )
+            cache_position = torch.tensor([attention_mask.shape[1]], device=attention_mask.device, dtype=torch.long)
+            step_attention_mask = torch.cat(
+                [attention_mask, torch.ones((1, 1), device=attention_mask.device, dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            self.tts.model.talker(
+                input_ids=input_token,
+                attention_mask=step_attention_mask,
+                past_key_values=prefill.past_key_values,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+                past_hidden=prefill.past_hidden,
+                generation_step=prefill.generation_step,
+                trailing_text_hidden=trailing_text_hidden,
+                tts_pad_embed=tts_pad_embed,
+                cache_position=cache_position,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def _move_speech_tokenizer_to_device(self, device: torch.device) -> None:
         speech_tokenizer = getattr(self.tts.model, "speech_tokenizer", None)
@@ -294,9 +367,6 @@ class AsyncTTSGenerator:
             "use_safetensors": True,
             "dtype": self.dtype,
         }
-        if self.args.attn_mode not in {"default", "none", ""}:
-            load_kwargs["attn_implementation"] = self.args.attn_mode
-
         model = AutoModel.from_pretrained(model_dir, **load_kwargs)
         model = model.to(self.device)
         model.eval()
@@ -317,6 +387,8 @@ class AsyncTTSGenerator:
     async def add_text(self, text: str) -> None:
         normalized = text.strip()
         if normalized:
+            if self.request_start_t is None:
+                self.request_start_t = time.perf_counter()
             await self.text_queue.put(normalized)
 
     async def finish(self) -> None:
@@ -331,8 +403,17 @@ class AsyncTTSGenerator:
                 if self.finished:
                     raise RuntimeError("Generation finished before any text chunk was received.")
                 await asyncio.sleep(self.args.poll_interval)
+            request_start_t = self.request_start_t if self.request_start_t is not None else time.perf_counter()
             first_chunk = self.text_queue.get_nowait()
             streamer = StreamingTextState(self.tts, holdback_tokens=self.args.token_holdback)
+            prefill_start_t = time.perf_counter()
+            first_codec_step_t: tp.Optional[float] = None
+            first_decode_start_t: tp.Optional[float] = None
+            first_decode_end_t: tp.Optional[float] = None
+            first_audio_emit_t: tp.Optional[float] = None
+            decode_total_s = 0.0
+            frame_milestones = (1, 2, 4, 8, 12)
+            frame_times: dict[int, float] = {}
 
             first_chunk_is_final = self.finished and self.text_queue.empty()
             streamer.push_text(first_chunk, final_chunk=first_chunk_is_final)
@@ -355,6 +436,7 @@ class AsyncTTSGenerator:
                 trailing_text_hidden=trailing_text_hidden,
                 tts_pad_embed=tts_pad_embed,
             )
+            prefill_end_t = time.perf_counter()
 
             past_key_values = prefill.past_key_values
             past_hidden = prefill.past_hidden
@@ -439,6 +521,12 @@ class AsyncTTSGenerator:
                 if (codec_ids < 0).any() or (codec_ids >= self.codebook_size).any():
                     codec_ids = codec_ids.clamp(0, self.codebook_size - 1)
                 codec_buffer.append(codec_ids)
+                if first_codec_step_t is None:
+                    first_codec_step_t = time.perf_counter()
+                buffered_frames = len(codec_buffer)
+                for milestone in frame_milestones:
+                    if buffered_frames >= milestone and milestone not in frame_times:
+                        frame_times[milestone] = time.perf_counter() - request_start_t
 
                 past_key_values = outputs.past_key_values
                 past_hidden = outputs.past_hidden
@@ -449,30 +537,75 @@ class AsyncTTSGenerator:
 
                 chunk_target_tokens = self.args.first_chunk_tokens if emitted_chunk_count == 0 else self.args.stream_chunk_tokens
                 if len(codec_buffer) >= chunk_target_tokens:
+                    decode_t0 = time.perf_counter()
+                    if first_decode_start_t is None:
+                        first_decode_start_t = decode_t0
                     await self._decode_and_emit(codec_buffer)
+                    decode_t1 = time.perf_counter()
+                    decode_total_s += decode_t1 - decode_t0
+                    if first_decode_end_t is None:
+                        first_decode_end_t = decode_t1
+                    if first_audio_emit_t is None:
+                        first_audio_emit_t = decode_t1
                     codec_buffer = []
                     emitted_chunk_count += 1
                     await asyncio.sleep(0)
 
             if codec_buffer:
+                decode_t0 = time.perf_counter()
+                if first_decode_start_t is None:
+                    first_decode_start_t = decode_t0
                 await self._decode_and_emit(codec_buffer)
+                decode_t1 = time.perf_counter()
+                decode_total_s += decode_t1 - decode_t0
+                if first_decode_end_t is None:
+                    first_decode_end_t = decode_t1
+                if first_audio_emit_t is None:
+                    first_audio_emit_t = decode_t1
 
-            self.profile = {
+            profile: dict[str, float] = {
                 "steps": float(step_count),
                 "talker_step_s": talker_step_s,
                 "talker_tok_s": step_count / max(talker_step_s, 1e-6),
+                "prefill_s": prefill_end_t - prefill_start_t,
+                "prefill_from_request_s": prefill_end_t - request_start_t,
+                "decode_total_s": decode_total_s,
             }
+            if first_codec_step_t is not None:
+                profile["first_codec_frame_s"] = first_codec_step_t - request_start_t
+            if first_decode_start_t is not None:
+                profile["first_decode_start_s"] = first_decode_start_t - request_start_t
+            if first_decode_start_t is not None and first_decode_end_t is not None:
+                profile["first_decode_s"] = first_decode_end_t - first_decode_start_t
+            if first_audio_emit_t is not None:
+                profile["first_audio_emit_s"] = first_audio_emit_t - request_start_t
+            for milestone, dt in frame_times.items():
+                profile[f"frames_{milestone}_s"] = dt
+
+            self.profile = profile
             print(
-                f"[profile] steps={step_count} talker_step_s={talker_step_s:.3f} "
-                f"talker_tok_s={self.profile['talker_tok_s']:.1f}"
+                f"[profile] steps={step_count} prefill_s={profile['prefill_s']:.3f} "
+                f"prefill_from_request_s={profile['prefill_from_request_s']:.3f} "
+                f"talker_step_s={talker_step_s:.3f} talker_tok_s={profile['talker_tok_s']:.1f} "
+                f"first_codec_frame_s={profile.get('first_codec_frame_s', float('nan')):.3f} "
+                f"frames_4_s={profile.get('frames_4_s', float('nan')):.3f} "
+                f"frames_8_s={profile.get('frames_8_s', float('nan')):.3f} "
+                f"frames_12_s={profile.get('frames_12_s', float('nan')):.3f} "
+                f"first_decode_start_s={profile.get('first_decode_start_s', float('nan')):.3f} "
+                f"first_decode_s={profile.get('first_decode_s', float('nan')):.3f} "
+                f"first_audio_emit_s={profile.get('first_audio_emit_s', float('nan')):.3f} "
+                f"decode_total_s={profile['decode_total_s']:.3f}"
             )
         finally:
             await self.audio_queue.put(None)
 
     async def _decode_and_emit(self, codec_buffer: list[torch.Tensor]) -> None:
         codes_tensor = torch.stack(codec_buffer, dim=0).to(self.device)
+        speech_tokenizer = self.tts.model.speech_tokenizer
+        if speech_tokenizer is None:
+            raise RuntimeError("Speech tokenizer is not loaded.")
         with torch.inference_mode():
-            wavs, sample_rate = self.tts.model.speech_tokenizer.decode([{"audio_codes": codes_tensor}])
+            wavs, sample_rate = speech_tokenizer.decode([{"audio_codes": codes_tensor}])
         self.sample_rate = int(sample_rate)
         audio_np = np.asarray(wavs[0], dtype=np.float32)
         audio_torch = torch.from_numpy(audio_np)
@@ -531,7 +664,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default="English", help="Language name, e.g. English/German/Auto.")
     parser.add_argument("--out-wav", default="./output_full_streaming.wav", help="Output wav path.")
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16", help="Compute dtype.")
-    parser.add_argument("--attn-mode", default="default", help="Attention impl: default/sdpa/flash_attention_2.")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--first-chunk-tokens", type=int, default=12)
     parser.add_argument("--stream-chunk-tokens", type=int, default=24)
